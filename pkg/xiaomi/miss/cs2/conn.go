@@ -28,7 +28,7 @@ func Dial(host, transport string) (*Conn, error) {
 		Conn:  conn,
 		isTCP: isTCP,
 		channels: [4]*dataChannel{
-			newDataChannel(0, 10), nil, newDataChannel(250, 100), nil,
+			newDataChannel(0, 10), nil, newDataChannel(250, 256), nil,
 		},
 	}
 	go c.worker()
@@ -57,7 +57,7 @@ func DialCloud(p2pID string, servers []string, deviceLANIP string) (*Conn, error
 		Conn:  conn,
 		isTCP: isTCP,
 		channels: [4]*dataChannel{
-			newDataChannel(0, 10), nil, newDataChannel(250, 100), nil,
+			newDataChannel(0, 10), nil, newDataChannel(250, 256), nil,
 		},
 	}
 	go c.worker()
@@ -1198,7 +1198,17 @@ func (c *dataChannel) Push(b []byte) error {
 		select {
 		case c.popBuf <- c.waitData[:c.waitSize]:
 		default:
-			return fmt.Errorf("pop buffer is full")
+			// Slow consumer or retransmit burst. Drop the oldest packet
+			// instead of killing the whole connection (stream restart).
+			// Ported from PR #2377.
+			select {
+			case <-c.popBuf:
+			default:
+			}
+			select {
+			case c.popBuf <- c.waitData[:c.waitSize]:
+			default: // consumer raced us, drop the new packet
+			}
 		}
 
 		c.waitData = c.waitData[c.waitSize:]
