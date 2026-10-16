@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,8 +45,8 @@ func Dial(host, transport string) (*Conn, error) {
 // of the form "PREFIX-NUM-SUFFIX" (e.g. "ABCDEF-123456-GHIJK").
 // relayHost is the Mi-Cloud relay IP (one of the published Alibaba Cloud
 // pool addresses, e.g. 47.236.156.107, 47.88.30.183, 47.88.30.225).
-func DialCloud(p2pID, relayHost string) (*Conn, error) {
-	conn, err := cloudHandshake(p2pID, relayHost)
+func DialCloud(p2pID string, servers []string, deviceLANIP string) (*Conn, error) {
+	conn, err := cloudHandshake2(p2pID, servers, deviceLANIP)
 	if err != nil {
 		return nil, err
 	}
@@ -146,10 +148,15 @@ func buildP2PIDBlock(p2pID string) ([]byte, error) {
 	numStr := parts[1]
 	suffix := parts[2]
 
-	if len(prefix) > 6 {
+	// Поля в блоке — 8 байт под префикс и 8 под суффикс, с добивкой нулями:
+	// это обычная для PPPP структура {char prefix[8]; uint32 num; char suffix[8]}.
+	// В исходной ветке стояли пределы 6 и 5 — они выведены из одного примера
+	// (ABCDEF-123456-GHIJK) и отрезают реальные идентификаторы Xiaomi:
+	// у реальных Xiaomi вида XMSYCNB-123456-ABCDE префикс из семи символов.
+	if len(prefix) > 8 {
 		return nil, fmt.Errorf("cs2 cloud: p2p_id prefix too long: %s", prefix)
 	}
-	if len(suffix) > 5 {
+	if len(suffix) > 8 {
 		return nil, fmt.Errorf("cs2 cloud: p2p_id suffix too long: %s", suffix)
 	}
 
@@ -159,9 +166,9 @@ func buildP2PIDBlock(p2pID string) ([]byte, error) {
 	}
 
 	block := make([]byte, 20)
-	copy(block[0:6], []byte(prefix))
+	copy(block[0:8], []byte(prefix))
 	binary.BigEndian.PutUint32(block[8:12], uint32(num))
-	copy(block[12:17], []byte(suffix))
+	copy(block[12:20], []byte(suffix))
 	return block, nil
 }
 
@@ -247,6 +254,17 @@ func buildCloudAuth(p2pID string, localIP net.IP, localPort uint16) ([]byte, err
 	copy(plain[0:20], uidBlock)
 	copy(plain[20:36], cloudAuthUnknownBlock[:])
 
+	// Правки по замечаниям автора ветки (он сверял 24 кадра 0xF9 с трафиком
+	// приложения Mi Home через Frida, но в саму ветку исправления не внёс):
+	//  - байт [23] у приложения 0x01, а не 0x06;
+	//  - [28..29] — не константа 0x0088, а номер сессии, свой на каждое
+	//    подключение; по его словам именно эта константа и роняет камеру
+	//    в «молчаливый отказ», когда релей уже ответил 0x21, а 0x40 нет.
+	// Наблюдались значения 0x40, 0x60, 0x6e, 0x6f, 0x87, 0x88, 0x102 —
+	// отсюда и диапазон.
+	plain[23] = 0x01
+	binary.BigEndian.PutUint16(plain[28:30], uint16(0x40+rand.IntN(0xD0)))
+
 	if v4 := localIP.To4(); v4 != nil && localPort != 0 {
 		// local_addr [36..51]
 		binary.LittleEndian.PutUint16(plain[38:40], localPort)
@@ -301,6 +319,18 @@ func detectOutboundIP(dest string) net.IP {
 //
 // Cloud mode is UDP-only: TCP would require TCP hole-punching from both
 // sides, which is not feasible behind typical NATs.
+// relayTimeout — сколько ждать 0x40 от релея. В ветке зашито 15 секунд;
+// вынесено в переменную окружения GO2RTC_CS2_TIMEOUT, чтобы проверять,
+// не отвечает ли релей просто медленнее (камера может спать).
+func relayTimeout() time.Duration {
+	if v := os.Getenv("GO2RTC_CS2_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 15 * time.Second
+}
+
 func cloudHandshake(p2pID, relayHost string) (net.Conn, error) {
 	udp, err := newUDPConn(relayHost, 32100)
 	if err != nil {
@@ -346,13 +376,25 @@ func cloudHandshake(p2pID, relayHost string) (net.Conn, error) {
 	// every 2 s in case packets were dropped.
 	buf := make([]byte, 1500)
 	var natInfo []byte
-	deadline := time.Now().Add(15 * time.Second)
+	// Счётчики ответов релея: без них «timeout waiting for 0x40» не отличить
+	// от «релей вообще молчит», а это разные диагнозы и разные действия.
+	var pktCount int
+	seen := map[byte]int{}
+	deadline := time.Now().Add(relayTimeout())
 	lastResend := time.Now()
 
 	for natInfo == nil {
 		if time.Now().After(deadline) {
 			_ = udp.Close()
-			return nil, fmt.Errorf("cs2 cloud: timeout waiting for 0x40 NAT-punch info")
+			var types []string
+			for k, v := range seen {
+				types = append(types, fmt.Sprintf("0x%02X x%d", k, v))
+			}
+			if len(types) == 0 {
+				types = append(types, "ничего")
+			}
+			return nil, fmt.Errorf("cs2 cloud: timeout waiting for 0x40 NAT-punch info (ответов релея: %d, типы: %s)",
+				pktCount, strings.Join(types, ", "))
 		}
 		if time.Since(lastResend) > 2*time.Second {
 			_, _ = uc.Write(req20)
@@ -369,6 +411,11 @@ func cloudHandshake(p2pID, relayHost string) (net.Conn, error) {
 			}
 			_ = udp.Close()
 			return nil, fmt.Errorf("cs2 cloud: read relay: %w", err)
+		}
+
+		pktCount++
+		if n >= 2 {
+			seen[buf[1]]++
 		}
 
 		if n < 4 || buf[0] != magic {
@@ -432,6 +479,305 @@ func cloudHandshake(p2pID, relayHost string) (net.Conn, error) {
 
 	_ = udp.SetDeadline(time.Time{})
 	return udp, nil
+}
+
+// ============================================================================
+//  Рабочая реализация облачного рукопожатия CS2 (переписана под живой протокол).
+//
+//  Отличия от исходной ветки PR #2264, все подтверждены замерами на живых
+//  камерах 21.09.2026:
+//   * серверы берутся из init_string устройства, а не из зашитого адреса —
+//     зашитый 47.236.156.107 отвечает RESULT_INVALID_PREFIX (0xFD) на эти did;
+//   * в 0x20 кладётся настоящий sockaddr_in клиента, а не unix-время;
+//   * читается байт результата в 0x21 — иначе отказ сервера выглядит таймаутом;
+//   * 0x20 шлётся ВСЕМ серверам из init_string, собираются ВСЕ 0x40
+//     (их приходит два: WAN- и LAN-адрес камеры), пробив идёт по всем
+//     кандидатам одновременно — за счёт этой избыточности рукопожатие
+//     проходит с первой попытки;
+//   * на 0x41 камеры немедленно отвечаем 0x42 — это фиксирует UDP-режим и
+//     уводит камеру от 0x43 (TCP), который через два NAT не проходит;
+//   * 0xF9 (шифрованная авторизация) НЕ отправляется вовсе — проверено, что
+//     0x40 приходит и без неё; вся возня ветки с полями 0xF9 не нужна.
+// ============================================================================
+
+// cs2InitLUT — 54-байтовая таблица PPPP_DecodeString. Проверена на эталонной
+// паре palant.info и на init_string обеих проверявшихся камер.
+var cs2InitLUT = [54]byte{
+	0x49, 0x59, 0x43, 0x3d, 0xb5, 0xbf, 0x6d, 0xa3, 0x47, 0x53, 0x4f, 0x61, 0x65, 0xe3,
+	0x71, 0xe9, 0x67, 0x7f, 0x02, 0x03, 0x0b, 0xad, 0xb3, 0x89, 0x2b, 0x2f, 0x35, 0xc1,
+	0x6b, 0x8b, 0x95, 0x97, 0x11, 0xe5, 0xa7, 0x0d, 0xef, 0xf1, 0x05, 0x07, 0x83, 0xfb,
+	0x9d, 0x3b, 0xc5, 0xc7, 0x13, 0x17, 0x1d, 0x1f, 0x25, 0x29, 0xd3, 0xdf,
+}
+
+// DecodeInitString расшифровывает PPPP init_string в список IPv4 rendezvous-
+// серверов, закреплённых за префиксом устройства. Формула:
+//
+//	raw[i] = base16(s[2i], s[2i+1]) по алфавиту 'A'..'P'
+//	out[i] = raw[i] XOR lut[i%54] XOR (out[0]^...^out[i-1] ^ 0x39)
+func DecodeInitString(s string) []string {
+	if len(s) < 2 || len(s)%2 != 0 {
+		return nil
+	}
+	out := make([]byte, len(s)/2)
+	var acc byte = 0x39
+	for i := range out {
+		c1, c2 := s[2*i], s[2*i+1]
+		if c1 < 'A' || c1 > 'P' || c2 < 'A' || c2 > 'P' {
+			return nil
+		}
+		raw := (c1-'A')<<4 | (c2 - 'A')
+		out[i] = raw ^ cs2InitLUT[i%54] ^ acc
+		acc ^= out[i]
+	}
+	var res []string
+	for _, p := range strings.Split(string(out), ",") {
+		p = strings.TrimRight(p, "\x00")
+		if ip := net.ParseIP(p); ip != nil && ip.To4() != nil {
+			res = append(res, ip.String())
+		}
+	}
+	return res
+}
+
+// resultName — расшифровка байта результата из 0x21 (enum T_result, PPPP).
+func resultName(b byte) string {
+	switch b {
+	case 0x00:
+		return "SUCCESS"
+	case 0xFC:
+		return "INVALID_DSK"
+	case 0xFD:
+		return "INVALID_PREFIX"
+	case 0xFE:
+		return "DEVICE_OFFLINE"
+	case 0xFF:
+		return "INVALID_UID"
+	}
+	return fmt.Sprintf("UNKNOWN_0x%02X", b)
+}
+
+func cs2Frame(typ byte, payload []byte) []byte {
+	m := make([]byte, 4+len(payload))
+	m[0] = magic
+	m[1] = typ
+	binary.BigEndian.PutUint16(m[2:4], uint16(len(payload)))
+	copy(m[4:], payload)
+	return m
+}
+
+// cs2Sockaddr кодирует адрес так, как это делает приложение Mi Home:
+// family 0x0002 (BE), порт little-endian, IPv4 в обратном порядке байт.
+func cs2Sockaddr(ip net.IP, port uint16) []byte {
+	b := make([]byte, 16)
+	b[0], b[1] = 0x00, 0x02
+	binary.LittleEndian.PutUint16(b[2:4], port)
+	if v4 := ip.To4(); v4 != nil {
+		b[4], b[5], b[6], b[7] = v4[3], v4[2], v4[1], v4[0]
+	}
+	return b
+}
+
+// cloudHandshake2 доводит облачное рукопожатие до готовности потока.
+// deviceLANIP — LAN-адрес камеры из device_list, используется только как
+// подсказка; реальные адреса для пробива приходят в 0x40.
+func cloudHandshake2(p2pID string, servers []string, deviceLANIP string) (net.Conn, error) {
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("cs2 cloud: нет rendezvous-серверов (init_string не расшифрован)")
+	}
+
+	udp, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	localPort := uint16(udp.LocalAddr().(*net.UDPAddr).Port)
+	localIP := detectOutboundIP(servers[0])
+
+	block, err := buildP2PIDBlock(p2pID)
+	if err != nil {
+		_ = udp.Close()
+		return nil, err
+	}
+
+	// 0x20 с настоящим sockaddr клиента в local_address (payload[20:36]).
+	reqPayload := make([]byte, 36)
+	copy(reqPayload[0:20], block)
+	copy(reqPayload[20:36], cs2Sockaddr(localIP, localPort))
+	req := cs2Frame(msgCloudConnect, reqPayload)
+	punch := cs2Frame(msgPunchPkt, block)
+	ready := cs2Frame(msgP2PRdyUDP, block)
+
+	srvAddrs := make([]*net.UDPAddr, 0, len(servers))
+	srvSet := map[string]bool{}
+	for _, s := range servers {
+		if a, e := net.ResolveUDPAddr("udp", net.JoinHostPort(s, "32100")); e == nil {
+			srvAddrs = append(srvAddrs, a)
+			srvSet[s] = true
+		}
+	}
+
+	type cand struct {
+		ip   net.IP
+		port int
+	}
+	var cands []cand
+	candSet := map[string]bool{}
+	addCand := func(ip net.IP, port int) {
+		if ip == nil || port <= 0 || port > 65535 {
+			return
+		}
+		k := fmt.Sprintf("%s:%d", ip, port)
+		if !candSet[k] {
+			candSet[k] = true
+			cands = append(cands, cand{ip, port})
+		}
+	}
+
+	buf := make([]byte, 2048)
+	deadline := time.Now().Add(relayTimeout())
+	var lastReq, lastPunch time.Time
+	rejects := map[string]byte{}
+	var camAddr *net.UDPAddr // адрес камеры, как только она пробьётся к нам
+
+	// Диагностика обмена: без неё «камера не завершила пробив» не отличить
+	// от «камера вообще молчала». Включается GO2RTC_CS2_DEBUG=1.
+	dbg := os.Getenv("GO2RTC_CS2_DEBUG") != ""
+	camSeen := map[string]int{}
+	t0 := time.Now()
+	trace := func(format string, a ...any) {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[cs2dbg %6.2fs] "+format+"\n",
+				append([]any{time.Since(t0).Seconds()}, a...)...)
+		}
+	}
+	trace("старт: p2p=%s серверы=%v", p2pID, servers)
+
+	for time.Now().Before(deadline) {
+		now := time.Now()
+		if now.Sub(lastReq) > 2*time.Second {
+			for _, a := range srvAddrs {
+				_, _ = udp.WriteToUDP(req, a)
+			}
+			lastReq = now
+		}
+		if len(cands) > 0 && now.Sub(lastPunch) > 250*time.Millisecond {
+			for _, c := range cands {
+				_, _ = udp.WriteToUDP(punch, &net.UDPAddr{IP: c.ip, Port: c.port})
+			}
+			// Как только камера пробилась — долбим её и пробоем, и готовностью,
+			// чтобы она либо начала данные по UDP, либо предложила TCP.
+			if camAddr != nil {
+				_, _ = udp.WriteToUDP(punch, camAddr)
+				_, _ = udp.WriteToUDP(ready, camAddr)
+			}
+			lastPunch = now
+		}
+
+		_ = udp.SetReadDeadline(now.Add(300 * time.Millisecond))
+		n, addr, err := udp.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			_ = udp.Close()
+			return nil, fmt.Errorf("cs2 cloud: чтение сокета: %w", err)
+		}
+		if n < 4 || buf[0] != magic {
+			continue
+		}
+		typ := buf[1]
+		fromServer := srvSet[addr.IP.String()]
+
+		if !fromServer {
+			k := fmt.Sprintf("0x%02X@%s", typ, addr)
+			camSeen[k]++
+			if camSeen[k] <= 3 {
+				trace("от КАМЕРЫ %s len=%d", k, n)
+			}
+		}
+
+		switch {
+		case typ == msgCloudAck && fromServer:
+			if n >= 5 {
+				if buf[4] == 0x00 {
+					delete(rejects, addr.IP.String())
+				} else {
+					rejects[addr.IP.String()] = buf[4]
+					if len(rejects) == len(srvSet) {
+						code := buf[4]
+						_ = udp.Close()
+						return nil, fmt.Errorf("cs2 cloud: все серверы отклонили %s: %s (0x%02X)",
+							p2pID, resultName(code), code)
+					}
+				}
+			}
+		case typ == msgNatPunch && fromServer && n >= 12:
+			// Порт в 0x40 читаем В ОБОИХ порядках байт и пробиваем оба:
+			// у разных серверов/сессий он приходит то LE, то BE, а угадать
+			// нельзя. Именно из-за одного лишь LE-чтения пробив срывался
+			// в большинстве сессий (камера не пробивала в ответ — дедлок).
+			ip := net.IPv4(buf[11], buf[10], buf[9], buf[8])
+			for _, port := range []int{
+				int(binary.LittleEndian.Uint16(buf[6:8])),
+				int(binary.BigEndian.Uint16(buf[6:8])),
+			} {
+				addCand(ip, port)
+				_, _ = udp.WriteToUDP(punch, &net.UDPAddr{IP: ip, Port: port})
+			}
+		case typ == msgPunchPkt && !fromServer:
+			// Камера пробивает нас (0x41). Запоминаем её адрес, отвечаем 0x42
+			// и пробиваем в ответ. НЕ возвращаемся здесь: на этой камере после
+			// 0x41 идёт 0x43 (TCP), а ранний возврат ронял медиа-цикл в
+			// "unknown msg f141" и поток не шёл. Ждём настоящего исхода ниже.
+			camAddr = &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port}
+			_, _ = udp.WriteToUDP(ready, addr)
+			_, _ = udp.WriteToUDP(punch, addr)
+		case (typ == msgP2PRdyUDP || typ == msgDrw || typ == msgDrwAck) && !fromServer:
+			// Камера подтвердила UDP (0x42) или уже шлёт данные (0xD0/0xD1) —
+			// UDP-путь состоялся. Отдаём сокет как есть, NAT-привязка на нём.
+			for i := 0; i < 4; i++ {
+				_, _ = udp.WriteToUDP(ready, addr)
+			}
+			_ = udp.SetReadDeadline(time.Time{})
+			return &udpConn{UDPConn: udp, addr: addr}, nil
+		case typ == msgP2PRdyTCP && !fromServer && n >= 28:
+			// Камера выбрала TCP. Подключаемся к её WAN-адресу и TCP-порту
+			// из кадра. Через два NAT это может не подняться — тогда не
+			// сдаёмся, продолжаем слать 0x42 в надежде на UDP-исход.
+			tportLE := int(binary.LittleEndian.Uint16(buf[26:28]))
+			tportBE := int(binary.BigEndian.Uint16(buf[26:28]))
+			trace("0x43 (камера хочет TCP): payload=%x порт LE=%d BE=%d",
+				buf[24:min(n, 32)], tportLE, tportBE)
+			// Пробуем оба прочтения порта и оба адреса камеры (WAN из пакета
+			// и LAN из полезной нагрузки) — вдруг NAT пропустит.
+			for _, tp := range []int{tportLE, tportBE} {
+				tgt := net.JoinHostPort(addr.IP.String(), strconv.Itoa(tp))
+				c, e := newTCPConn(tgt)
+				if e == nil {
+					trace("TCP поднялся на %s", tgt)
+					_ = udp.Close()
+					return c, nil
+				}
+				trace("TCP к %s не вышел: %v", tgt, e)
+			}
+			_, _ = udp.WriteToUDP(ready, addr)
+		}
+	}
+
+	trace("ВЫХОД по таймауту. кандидаты=%v пакеты от камеры=%v", cands, camSeen)
+	_ = udp.Close()
+	if len(rejects) > 0 {
+		for ip, code := range rejects {
+			return nil, fmt.Errorf("cs2 cloud: сервер %s отклонил %s: %s (0x%02X), камера не ответила",
+				ip, p2pID, resultName(code), code)
+		}
+	}
+	if len(camSeen) > 0 {
+		return nil, fmt.Errorf("cs2 cloud: камера отвечала, но не завершила рукопожатие: %v", camSeen)
+	}
+	if len(cands) == 0 {
+		return nil, fmt.Errorf("cs2 cloud: ни один сервер не прислал 0x40 (серверы %v)", servers)
+	}
+	return nil, fmt.Errorf("cs2 cloud: камера не завершила пробив (кандидаты %v)", cands)
 }
 
 type Conn struct {

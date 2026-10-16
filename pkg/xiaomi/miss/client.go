@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -55,11 +56,16 @@ func NewClient(rawURL string) (*Client, error) {
 	var conn Conn
 	switch s := query.Get("vendor"); s {
 	case "cs2":
-		// If a p2p_id is present, the camera only reachable via the
-		// Mi-Cloud relay (typical for MJA1-secure-element cameras such
-		// as the c302n). Otherwise fall back to the direct LAN handshake.
-		if p2pID := query.Get("p2p_id"); p2pID != "" {
-			conn, err = cs2.DialCloud(p2pID, u.Host)
+		// Облачный путь ТОЛЬКО когда getMissURL положил список серверов
+		// (p2p_servers) — а он это делает исключительно для did из
+		// GO2RTC_CS2_CLOUD_DIDS. Все остальные cs2-камеры идут прежним
+		// локальным путём cs2.Dial — их поведение не меняется.
+		if servers := query.Get("p2p_servers"); servers != "" {
+			conn, err = cs2.DialCloud(
+				query.Get("p2p_id"),
+				strings.Split(servers, ","),
+				u.Hostname(),
+			)
 		} else {
 			conn, err = cs2.Dial(u.Host, query.Get("transport"))
 		}

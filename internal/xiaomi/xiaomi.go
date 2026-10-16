@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
 	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
+	"github.com/AlexxIT/go2rtc/pkg/xiaomi/miss/cs2"
 	"github.com/rs/zerolog"
 )
 
@@ -149,11 +151,21 @@ func getLegacyURL(url *url.URL) (string, error) {
 	return url.String(), nil
 }
 
-// cs2CloudRelayHost is the Mi-Cloud relay endpoint used by cs2 cameras
-// that do not expose port 32108 on the LAN (e.g. xiaomi.camera.c302n).
-// One of a small published pool of Alibaba Cloud addresses; a future
-// improvement could derive the right one from the p2p_id region prefix.
-const cs2CloudRelayHost = "47.236.156.107"
+// cloudEnabledForDID сообщает, разрешён ли облачный путь CS2 для данного did.
+// Список did задаётся через GO2RTC_CS2_CLOUD_DIDS (через запятую). Пусто —
+// облачный путь выключен для всех, и каждая камера работает как раньше.
+func cloudEnabledForDID(did string) bool {
+	list := os.Getenv("GO2RTC_CS2_CLOUD_DIDS")
+	if list == "" || did == "" {
+		return false
+	}
+	for _, d := range strings.Split(list, ",") {
+		if strings.TrimSpace(d) == did {
+			return true
+		}
+	}
+	return false
+}
 
 func getMissURL(url *url.URL) (string, error) {
 	clientPublic, clientPrivate, err := crypto.GenerateKey()
@@ -179,7 +191,8 @@ func getMissURL(url *url.URL) (string, error) {
 		Vendor struct {
 			ID     byte `json:"vendor"`
 			Params struct {
-				UID string `json:"p2p_id"`
+				UID        string `json:"p2p_id"`
+				InitString string `json:"init_string"`
 			} `json:"vendor_params"`
 		} `json:"vendor"`
 		PublicKey string `json:"public_key"`
@@ -199,15 +212,27 @@ func getMissURL(url *url.URL) (string, error) {
 		query.Set("uid", v.Vendor.Params.UID)
 	}
 
-	// cs2 cloud-relay mode: cameras of the MJA1-secure-element generation
-	// (e.g. xiaomi.camera.c302n) cannot be reached on the LAN port — they
-	// only stream via the Mi-Cloud relay. Pass the p2p_id through and
-	// redirect the host to the relay; the miss client picks this up and
-	// runs the cloud handshake.
-	if v.Vendor.ID == 4 && v.Vendor.Params.UID != "" {
+	// Облачный путь CS2 — ТОЛЬКО для камер, чей did перечислен в
+	// GO2RTC_CS2_CLOUD_DIDS (через запятую). Это камеры в другом доме,
+	// до которых нет локальной сети. Все прочие камеры сюда не заходят
+	// и работают ровно как раньше — прямым локальным cs2.Dial.
+	//
+	// Серверы берутся из init_string того же ответа облака (по три штуки
+	// на камеру, привязаны к региону), а НЕ из зашитого адреса: зашитый
+	// 47.236.156.107 отвечает этим did кодом INVALID_PREFIX. url.Host не
+	// трогаем — там LAN-адрес камеры, он ещё нужен как подсказка.
+	if v.Vendor.Params.UID != "" && cloudEnabledForDID(query.Get("did")) {
+		servers := cs2.DecodeInitString(v.Vendor.Params.InitString)
+		if env := os.Getenv("GO2RTC_CS2_RELAY"); env != "" {
+			servers = strings.Split(env, ",") // ручное переопределение для отладки
+		}
+		if len(servers) == 0 {
+			return "", fmt.Errorf("xiaomi: cs2 cloud: не удалось расшифровать init_string для did %s",
+				query.Get("did"))
+		}
 		query.Set("p2p_id", v.Vendor.Params.UID)
-		log.Debug().Msgf("xiaomi: cs2 cloud-relay mode, redirecting to %s", cs2CloudRelayHost)
-		url.Host = cs2CloudRelayHost
+		query.Set("p2p_servers", strings.Join(servers, ","))
+		log.Debug().Msgf("xiaomi: cs2 cloud did=%s servers=%v", query.Get("did"), servers)
 	}
 
 	url.RawQuery = query.Encode()
