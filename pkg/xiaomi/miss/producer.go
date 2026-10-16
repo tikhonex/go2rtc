@@ -129,6 +129,7 @@ const timestamp40ms = 48000 * 0.040
 
 func (p *Producer) Start() error {
 	var audioTS uint32
+	var gop gopCache
 
 	for {
 		_ = p.client.SetDeadline(time.Now().Add(10 * time.Second))
@@ -186,11 +187,61 @@ func (p *Producer) Start() error {
 
 		for _, recv := range p.Receivers {
 			if recv.Codec.Name == name {
-				recv.WriteRTP(pkt2)
+				switch name {
+				case core.CodecH264:
+					gop.write(recv, pkt2, h264.IsKeyframe(pkt2.Payload))
+				case core.CodecH265:
+					gop.write(recv, pkt2, h265.IsKeyframe(pkt2.Payload))
+				default:
+					recv.WriteRTP(pkt2)
+				}
 				break
 			}
 		}
 	}
+}
+
+// gopCache gives a viewer joining a running stream the frames since the
+// last keyframe at once. Without it the viewer's decoder waits for the
+// camera's next keyframe (several seconds on these cameras). The replayed
+// frames keep their times: the player plays them out fast to live.
+// Ported from 76b3e45 (xiaomi: cs2 cloud-relay + relay-media).
+type gopCache struct {
+	frames   []*core.Packet
+	overflow bool
+	seen     map[*core.Node]bool
+}
+
+// gopMax holds 6 s of 25 fps with room; a longer interval replays nothing
+// rather than an incomplete run of frames.
+const gopMax = 400
+
+func (g *gopCache) write(recv *core.Receiver, pkt *core.Packet, keyframe bool) {
+	if keyframe {
+		g.frames = g.frames[:0]
+		g.overflow = false
+	}
+	if !g.overflow && (keyframe || len(g.frames) > 0) {
+		if len(g.frames) < gopMax {
+			g.frames = append(g.frames, pkt)
+		} else {
+			g.frames = g.frames[:0]
+			g.overflow = true
+		}
+	}
+	childs := recv.Node.Childs()
+	seen := make(map[*core.Node]bool, len(childs))
+	for _, c := range childs {
+		// A new viewer, not starting on a keyframe anyway.
+		if !g.seen[c] && g.seen != nil && !keyframe && len(g.frames) > 1 {
+			for _, f := range g.frames[:len(g.frames)-1] {
+				c.Input(f)
+			}
+		}
+		seen[c] = true
+	}
+	g.seen = seen
+	recv.WriteRTP(pkt)
 }
 
 func (p *Producer) Stop() error {
