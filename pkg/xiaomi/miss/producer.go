@@ -129,6 +129,8 @@ const timestamp40ms = 48000 * 0.040
 
 func (p *Producer) Start() error {
 	var audioTS uint32
+	var videoOffset uint32
+	var videoStarted bool
 	var gop gopCache
 
 	for {
@@ -146,10 +148,17 @@ func (p *Producer) Start() error {
 
 		switch pkt.CodecID {
 		case codecH264, codecH265:
+			if !videoStarted {
+				// Device clocks can restart on reconnect, while consumers keep
+				// their existing RTP timeline. Preserve frame intervals but
+				// anchor each new session to the host clock.
+				videoOffset = TimeToRTP(uint64(time.Now().UnixMilli()), 90000) - TimeToRTP(pkt.Timestamp, 90000)
+				videoStarted = true
+			}
 			pkt2 = &core.Packet{
 				Header: rtp.Header{
 					SequenceNumber: uint16(pkt.Sequence),
-					Timestamp:      TimeToRTP(pkt.Timestamp, 90000),
+					Timestamp:      TimeToRTP(pkt.Timestamp, 90000) + videoOffset,
 				},
 				Payload: annexb.EncodeToAVCC(pkt.Payload),
 			}
