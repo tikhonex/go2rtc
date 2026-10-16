@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/app"
@@ -16,6 +17,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/xiaomi"
 	"github.com/AlexxIT/go2rtc/pkg/xiaomi/crypto"
+	"github.com/rs/zerolog"
 )
 
 func Init() {
@@ -26,7 +28,7 @@ func Init() {
 
 	tokens = v.Cfg
 
-	log := app.GetLogger("xiaomi")
+	log = app.GetLogger("xiaomi")
 
 	streams.HandleFunc("xiaomi", func(rawURL string) (core.Producer, error) {
 		u, err := url.Parse(rawURL)
@@ -49,9 +51,32 @@ func Init() {
 	api.HandleFunc("api/xiaomi", apiXiaomi)
 }
 
+var log zerolog.Logger
+
 var tokens map[string]string
 var clouds map[string]*xiaomi.Cloud
 var cloudsMu sync.Mutex
+
+// The cloud session (serviceToken) expires after several days. On 401 the
+// cached session is dropped and a new one is made from the passToken in the
+// config. A failed login is not retried earlier than cloudRetryDelay, and if
+// new sessions keep getting 401, the pause between resets doubles up to
+// cloudMaxDelay. So a rejected token can't turn every stream reconnect into
+// a login request to account.xiaomi.com.
+var cloudRetryDelay = time.Minute
+var cloudMaxDelay = 30 * time.Minute
+var cloudResets = map[string]cloudReset{}
+var loginErrors = map[string]loginError{}
+
+type cloudReset struct {
+	time  time.Time
+	delay time.Duration // no new reset before time + delay
+}
+
+type loginError struct {
+	err  error
+	time time.Time
+}
 
 func getCloud(userID string) (*xiaomi.Cloud, error) {
 	cloudsMu.Lock()
@@ -61,10 +86,17 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
 		return cloud, nil
 	}
 
+	if e, ok := loginErrors[userID]; ok && time.Since(e.time) < cloudRetryDelay {
+		return nil, e.err
+	}
+
 	cloud := xiaomi.NewCloud(AppXiaomiHome)
 	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
+		loginErrors[userID] = loginError{err: err, time: time.Now()}
 		return nil, err
 	}
+	delete(loginErrors, userID)
+
 	if clouds == nil {
 		clouds = map[string]*xiaomi.Cloud{userID: cloud}
 	} else {
@@ -73,9 +105,48 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
 	return cloud, nil
 }
 
+// resetCloud drops the cached session if it is still the one that got 401.
+// Returns false if it is too early for another reset.
+func resetCloud(userID string, cloud *xiaomi.Cloud) bool {
+	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+
+	if clouds[userID] != cloud {
+		return true // already replaced by another request
+	}
+
+	r := cloudResets[userID]
+	since := time.Since(r.time)
+	if since < r.delay {
+		return false
+	}
+	if since < 2*cloudMaxDelay {
+		// the previous new session was rejected soon after login
+		r.delay = min(r.delay*2, cloudMaxDelay)
+	} else {
+		r.delay = cloudRetryDelay
+	}
+	r.time = time.Now()
+	cloudResets[userID] = r
+
+	delete(clouds, userID)
+
+	log.Warn().Msgf("xiaomi: cloud session expired, login again user=%s next_reset_after=%s", userID, r.delay)
+	return true
+}
+
 func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
 	cloud, err := getCloud(userID)
 	if err != nil {
+		return nil, err
+	}
+
+	res, err := cloud.Request(GetBaseURL(region), apiURL, params, nil)
+	if !errors.Is(err, xiaomi.ErrUnauthorized) || !resetCloud(userID, cloud) {
+		return res, err
+	}
+
+	if cloud, err = getCloud(userID); err != nil {
 		return nil, err
 	}
 	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
@@ -322,6 +393,7 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
 		} else {
 			tokens[userID] = token
 		}
+		delete(loginErrors, userID) // try the new token right away
 		cloudsMu.Unlock()
 
 		err = app.PatchConfig([]string{"xiaomi", userID}, token)
