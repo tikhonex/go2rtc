@@ -35,6 +35,10 @@ type Cloud struct {
 	auth map[string]string
 }
 
+// ErrUnauthorized is returned by Request when the cloud no longer accepts
+// the session (serviceToken has expired). Text is the same as res.Status.
+var ErrUnauthorized = errors.New("401 Unauthorized")
+
 func NewCloud(sid string) *Cloud {
 	return &Cloud{
 		client: &http.Client{Timeout: 15 * time.Second},
@@ -434,6 +438,9 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
 	}
 	defer res.Body.Close()
 
+	if res.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
 	if res.StatusCode != http.StatusOK {
 		return nil, errors.New(res.Status)
 	}
